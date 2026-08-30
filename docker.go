@@ -32,7 +32,8 @@ var upstreamFilters = runningFilters.Clone().
 
 type DockerClientImpl struct {
 	cli              *client.Client
-	caddyContainerId string
+	caddyContainerID string
+	caddyNetworkID   string
 }
 
 type DockerClient interface {
@@ -72,7 +73,7 @@ func (docker *DockerClientImpl) findCaddyContainer() error {
 		return fmt.Errorf("Caddy container not found: no containers match %v", serverFilters)
 	}
 
-	docker.caddyContainerId = resp.Items[0].ID
+	docker.caddyContainerID = resp.Items[0].ID
 	return nil
 }
 
@@ -85,66 +86,76 @@ func (docker *DockerClientImpl) isRoutableContainer(labels map[string]string) bo
 	return true
 }
 
-func (docker *DockerClientImpl) ConnectToNetwork(ctx context.Context, networkId string) error {
+func (docker *DockerClientImpl) ConnectToNetwork(ctx context.Context, networkID string) error {
+	// If this is caddy's network, nothing to do
+	if networkID == docker.caddyNetworkID {
+		return nil
+	}
+
 	// Check if the network exists and if caddy is already connected
-	resp, err := docker.cli.NetworkInspect(ctx, networkId, client.NetworkInspectOptions{})
+	resp, err := docker.cli.NetworkInspect(ctx, networkID, client.NetworkInspectOptions{})
 	if err != nil {
 		// network might not be by name (could be ID). Try list networks and match prefix
-		return fmt.Errorf("Network %s not found: %w", networkId, err)
+		return fmt.Errorf("Network %s not found: %w", networkID, err)
 	}
 
 	// If already connected, nothing to do
 	if resp.Network.Containers != nil {
 		for cont := range resp.Network.Containers {
-			if cont == docker.caddyContainerId {
-				slog.Debug("Caddy is already connected to network", slog.String("networkId", networkId))
+			if cont == docker.caddyContainerID {
+				slog.Debug("Caddy is already connected to network", slog.String("networkId", networkID))
 				return nil
 			}
 		}
 	}
 
 	// Connect caddy
-	_, err = docker.cli.NetworkConnect(ctx, networkId, client.NetworkConnectOptions{Container: docker.caddyContainerId})
+	_, err = docker.cli.NetworkConnect(ctx, networkID, client.NetworkConnectOptions{Container: docker.caddyContainerID})
 	if err != nil {
 		return err
 	}
 
-	slog.Info("Connected caddy to network", slog.String("networkId", networkId))
+	slog.Info("Connected caddy to network", slog.String("networkId", networkID))
 	return nil
 }
 
-func (docker *DockerClientImpl) DisconnectFromNetwork(ctx context.Context, networkId string) error {
-	resp, err := docker.cli.NetworkInspect(ctx, networkId, client.NetworkInspectOptions{})
+func (docker *DockerClientImpl) DisconnectFromNetwork(ctx context.Context, networkID string) error {
+	// Don't disconnect from caddy's original network
+	if networkID == docker.caddyNetworkID {
+		return nil
+	}
+
+	resp, err := docker.cli.NetworkInspect(ctx, networkID, client.NetworkInspectOptions{})
 	if err != nil {
-		return fmt.Errorf("Network %s not found: %w", networkId, err)
+		return fmt.Errorf("Network %s not found: %w", networkID, err)
 	}
 
 	// Only disconnect if already connected
 	if resp.Network.Containers != nil {
 		found := false
 		for cont := range resp.Network.Containers {
-			if cont == docker.caddyContainerId {
+			if cont == docker.caddyContainerID {
 				found = true
 			}
 		}
 		if !found {
-			slog.Debug("Caddy already disconnected from network", slog.String("networkId", networkId))
+			slog.Debug("Caddy already disconnected from network", slog.String("networkId", networkID))
 			return nil
 		}
 	}
 
 	// Force disconnect (true)
-	_, err = docker.cli.NetworkDisconnect(ctx, networkId, client.NetworkDisconnectOptions{Container: docker.caddyContainerId, Force: true})
+	_, err = docker.cli.NetworkDisconnect(ctx, networkID, client.NetworkDisconnectOptions{Container: docker.caddyContainerID, Force: true})
 	if err != nil {
 		return err
 	}
 
-	slog.Info("Disconnected caddy from network", slog.String("networkId", networkId))
+	slog.Info("Disconnected caddy from network", slog.String("networkId", networkID))
 	return nil
 }
 
-func (docker *DockerClientImpl) GetContainerRoutes(ctx context.Context, containerId string) ([]RouteEntry, error) {
-	resp, err := docker.cli.ContainerInspect(ctx, containerId, client.ContainerInspectOptions{Size: false})
+func (docker *DockerClientImpl) GetContainerRoutes(ctx context.Context, containerID string) ([]RouteEntry, error) {
+	resp, err := docker.cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{Size: false})
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +163,7 @@ func (docker *DockerClientImpl) GetContainerRoutes(ctx context.Context, containe
 	// Make sure this container is enabled
 	labels := resp.Container.Config.Labels
 	if !docker.isRoutableContainer(labels) {
-		return nil, fmt.Errorf("Container %s is not enabled %w", containerId, labels)
+		return nil, fmt.Errorf("Container %s is not enabled %w", containerID, labels)
 	}
 
 	entry := RouteEntry{
@@ -189,7 +200,7 @@ func (docker *DockerClientImpl) GetContainerRoutes(ctx context.Context, containe
 
 	// Verify we have a valid route before returning
 	if len(entry.Hosts) == 0 || entry.Network == "" || entry.Port == "" {
-		return nil, fmt.Errorf("Container %s is missing required labels: host=%s, network=%s, port=%s", containerId, entry.Hosts, entry.Network, entry.Port)
+		return nil, fmt.Errorf("Container %s is missing required labels: host=%s, network=%s, port=%s", containerID, entry.Hosts, entry.Network, entry.Port)
 	}
 
 	return []RouteEntry{

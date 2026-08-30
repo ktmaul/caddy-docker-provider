@@ -1,0 +1,8 @@
+{
+    debug
+    local_certs
+}
+
+* {
+    respond "Not found" 404
+}

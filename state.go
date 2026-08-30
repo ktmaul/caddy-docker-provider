@@ -12,34 +12,39 @@ type RouteEntry struct {
 	IP          string
 }
 
-type State struct {
-	routes []RouteEntry
-	mutex  sync.Mutex
+type AppStateImpl struct {
+	caddyContainerID string
+	caddyNetworkID   string
+	routes           []RouteEntry
+	mutex            *sync.Mutex
 }
 
-type StateBag interface {
+type AppState interface {
 	AddRoute(entry RouteEntry)
 	FindByContainer(containerId string) *RouteEntry
 	HasNetworkRoutes(network string) bool
 	RemoveRoute(entry RouteEntry)
 }
 
-func NewStateBag() StateBag {
-	return &State{routes: []RouteEntry{}}
+func NewStateBag() AppState {
+	return &AppStateImpl{
+		routes: []RouteEntry{},
+		mutex:  &sync.Mutex{},
+	}
 }
 
-func (state *State) AddRoute(entry RouteEntry) {
+func (state *AppStateImpl) AddRoute(entry RouteEntry) {
 	state.mutex.Lock()
 	state.routes = append(state.routes, entry)
 	state.mutex.Unlock()
 }
 
-func (state *State) FindByContainer(containerId string) *RouteEntry {
+func (state *AppStateImpl) FindByContainer(containerID string) *RouteEntry {
 	state.mutex.Lock()
 	defer state.mutex.Unlock()
 
 	for _, item := range state.routes {
-		if item.ContainerID == containerId {
+		if item.ContainerID == containerID {
 			return &item
 		}
 	}
@@ -47,12 +52,12 @@ func (state *State) FindByContainer(containerId string) *RouteEntry {
 	return nil
 }
 
-func (state *State) HasNetworkRoutes(network string) bool {
+func (state *AppStateImpl) HasNetworkRoutes(networkID string) bool {
 	state.mutex.Lock()
 	defer state.mutex.Unlock()
 
 	for _, item := range state.routes {
-		if item.Network == network {
+		if item.Network == networkID {
 			return true
 		}
 	}
@@ -60,7 +65,7 @@ func (state *State) HasNetworkRoutes(network string) bool {
 	return false
 }
 
-func (state *State) RemoveRoute(entry RouteEntry) {
+func (state *AppStateImpl) RemoveRoute(entry RouteEntry) {
 	state.mutex.Lock()
 
 	for i, item := range state.routes {

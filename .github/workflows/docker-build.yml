@@ -51,6 +51,6 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
-          push: ${{ github.event_name == 'release' }}
+          push: ${{ github.event_name == 'push' }}
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
