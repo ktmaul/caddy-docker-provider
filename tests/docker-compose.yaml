@@ -1,0 +1,35 @@
+services:
+  caddy:
+    image: caddy:2
+    labels:
+      caddy.server: true
+    ports:
+      - 40080:80/tcp
+      - 40443:443/tcp
+      - 40443:443/udp
+    restart: unless-stopped
+    volumes:
+     - ./Caddyfile:/etc/caddy/Caddyfile # Setting static routes and other configs
+  provider:
+    build: ..
+    image: caddy-docker-provider:dev
+    depends_on:
+      - caddy
+    environment:
+      CADDY_API_URL: http://localhost:2019/
+      LOG_LEVEL: DEBUG
+    network_mode: service:caddy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+  services:
+    image: busybox
+    command: httpd -f -v -p 8080
+    depends_on:
+      provider:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+    labels:
+      caddy.http.enable: "true"
+      caddy.http.hosts: "example.com"
+      caddy.http.upstream.port: "8080"
