@@ -3,20 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 )
 
 const CADDY_API_VARIABLE = "CADDY_API_URL"
 
-type CaddyDirective struct {
+type CaddyRoute struct {
 	ID     string                 `json:"@id"`
 	Match  []any                  `json:"match"`
 	Handle []CaddyUpstreamHandler `json:"handle"`
@@ -24,6 +22,10 @@ type CaddyDirective struct {
 
 type HostMatch struct {
 	Host []string `json:"host"`
+}
+
+type PathMatch struct {
+	Path []string `json:"path"`
 }
 
 type CaddyUpstreamHandler struct {
@@ -37,20 +39,21 @@ type CaddyUpstream struct {
 }
 
 type CaddyClientImpl struct {
-	directives map[string]CaddyDirective
+	routes     []string
 	serverName string
 	serverURL  string
 }
 
 type CaddyClient interface {
 	CreateRoute(ctx context.Context, route RouteEntry) error
-	RemoveRoute(ctx context.Context, route RouteEntry) error
+	CreateUpstream(ctx context.Context, routeID string, upstream RouteUpstream) error
+	RemoveRoute(ctx context.Context, routeID string) error
+	RemoveUpstream(ctx context.Context, routeID string, upstreamID string) error
 }
 
 func NewCaddyClient() (CaddyClient, error) {
 	caddy := CaddyClientImpl{
-		directives: make(map[string]CaddyDirective),
-		serverURL:  getenv(CADDY_API_VARIABLE, "http://localhost:2019"),
+		serverURL: getenv(CADDY_API_VARIABLE, "http://localhost:2019"),
 	}
 
 	response, err := caddy.executeHttpRequest(context.Background(), "GET", "/config/apps/http/servers", nil)
@@ -97,6 +100,8 @@ func (caddy *CaddyClientImpl) createHttpRequest(method string, relativeURL strin
 }
 
 func (caddy *CaddyClientImpl) executeHttpRequest(ctx context.Context, method string, relativeURL string, requestBody any) (map[string]interface{}, error) {
+	slog.Debug("Sending API request", slog.String("method", method), slog.String("relativeURL", relativeURL), slog.Any("requestBody", requestBody))
+
 	req, err := caddy.createHttpRequest(method, relativeURL, requestBody)
 	if err != nil {
 		return nil, err
@@ -122,93 +127,85 @@ func (caddy *CaddyClientImpl) executeHttpRequest(ctx context.Context, method str
 	return response, err
 }
 
-func (caddy *CaddyClientImpl) convertToDirective(entry RouteEntry) CaddyDirective {
-	match := HostMatch{
-		Host: entry.Hosts,
+func (caddy *CaddyClientImpl) convertRoute(route RouteEntry) CaddyRoute {
+	var match any
+	if len(route.Paths) > 0 {
+		match = PathMatch{
+			Path: route.Paths,
+		}
 	}
 
-	port := entry.Port
-	if port == "" {
-		port = "80"
-	}
-
-	host := entry.IP
-	if host == "" {
-		// Use container name for dial (requires Caddy to be on the same network)
-		host = entry.ContainerID[:12]
+	if len(route.Hosts) > 0 {
+		match = HostMatch{
+			Host: route.Hosts,
+		}
 	}
 
 	handle := CaddyUpstreamHandler{
-		Handler: "reverse_proxy",
-		Upstreams: []CaddyUpstream{
-			{
-				ID:   entry.ContainerID,
-				Dial: fmt.Sprintf("%s:%s", host, port),
-			},
-		},
+		Handler:   "reverse_proxy",
+		Upstreams: make([]CaddyUpstream, 0),
 	}
 
-	sort.Strings(match.Host)
-	return CaddyDirective{
-		ID:     caddy.createHash(strings.Join(match.Host, ",")),
+	for _, upstream := range route.Upstreams {
+		handle.Upstreams = append(handle.Upstreams, caddy.convertUpstream(route.RouteID, upstream))
+	}
+
+	return CaddyRoute{
+		ID:     route.RouteID,
 		Match:  []any{match},
 		Handle: []CaddyUpstreamHandler{handle},
 	}
 }
 
-func (caddy *CaddyClientImpl) createHash(value string) string {
-	hash := md5.Sum([]byte(value))
-	return base64.URLEncoding.EncodeToString(hash[:])
+func (caddy *CaddyClientImpl) convertUpstream(routeID string, upstream RouteUpstream) CaddyUpstream {
+	return CaddyUpstream{
+		ID:   fmt.Sprintf("%s-%s", routeID, upstream.ContainerID),
+		Dial: fmt.Sprintf("%s:%s", upstream.IP, upstream.Port),
+	}
 }
 
 func (caddy *CaddyClientImpl) CreateRoute(ctx context.Context, route RouteEntry) error {
-	// TODO: A route is defined more by the matcher than the container.
-	// Need a way to group routes by matcher and add/remove containers
-	// as upstreams. An id will be needed for the matcher and the upstream.
-	directive := caddy.convertToDirective(route)
+	value := caddy.convertRoute(route)
 
-	// TODO: Check if the directive already exists and send just the upstream instead
-	if existing, exists := caddy.directives[directive.ID]; exists {
-		upstreamExists := false
-		for i, upstream := range existing.Handle[0].Upstreams {
-			if upstream.ID == route.ContainerID {
-				existing.Handle[0].Upstreams[i] = directive.Handle[0].Upstreams[0]
-				upstreamExists = true
-				break
-			}
-		}
-
-		// If the upstream doesn't exist, add it to the list
-		if !upstreamExists {
-			existing.Handle[0].Upstreams = append(existing.Handle[0].Upstreams, directive.Handle[0].Upstreams[0])
-		}
-
-		// POST to /config/ to add a route
-		_, err := caddy.executeHttpRequest(ctx, "PATCH", fmt.Sprintf("/id/%s", existing.ID), existing)
+	if slices.Contains(caddy.routes, route.RouteID) {
+		_, err := caddy.executeHttpRequest(ctx, "PUT", fmt.Sprintf("/id/%s", value.ID), value)
 		if err == nil {
-			slog.Info("Added route", slog.String("containerID", route.ContainerID))
 			return nil
 		}
-
-		return err
 	}
 
-	// POST to /config/ to add a route
-	_, err := caddy.executeHttpRequest(ctx, "POST", fmt.Sprintf("/config/apps/http/servers/%s/routes", caddy.serverName), directive)
+	_, err := caddy.executeHttpRequest(ctx, "POST", fmt.Sprintf("/config/apps/http/servers/%s/routes", caddy.serverName), value)
 	if err == nil {
-		caddy.directives[directive.ID] = directive
-		slog.Info("Added route", slog.String("containerID", route.ContainerID))
+		caddy.routes = append(caddy.routes, route.RouteID)
 		return nil
 	}
 
 	return err
 }
 
-func (caddy *CaddyClientImpl) RemoveRoute(ctx context.Context, route RouteEntry) error {
-	// DELETE to the @id endpoint
-	_, err := caddy.executeHttpRequest(ctx, "DELETE", fmt.Sprintf("/id/%s", route.ContainerID), nil)
+func (caddy *CaddyClientImpl) CreateUpstream(ctx context.Context, routeID string, upstream RouteUpstream) error {
+	value := caddy.convertUpstream(routeID, upstream)
+
+	_, err := caddy.executeHttpRequest(ctx, "POST", fmt.Sprintf("/id/%s/handle/0/upstreams", routeID), value)
 	if err == nil {
-		slog.Info("Removed route", slog.String("containerID", route.ContainerID))
+		return nil
+	}
+
+	return err
+}
+
+func (caddy *CaddyClientImpl) RemoveRoute(ctx context.Context, routeID string) error {
+	_, err := caddy.executeHttpRequest(ctx, "DELETE", fmt.Sprintf("/id/%s", routeID), nil)
+	if err == nil {
+		return nil
+	}
+
+	return err
+}
+
+func (caddy *CaddyClientImpl) RemoveUpstream(ctx context.Context, routeID string, upstreamID string) error {
+	_, err := caddy.executeHttpRequest(ctx, "DELETE", fmt.Sprintf("/id/%s", fmt.Sprintf("%s-%s", routeID, upstreamID)), nil)
+	if err == nil {
 		return nil
 	}
 

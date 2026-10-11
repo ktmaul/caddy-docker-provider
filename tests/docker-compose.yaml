@@ -1,3 +1,5 @@
+name: caddy-docker-provider
+
 services:
   caddy:
     image: caddy:2
@@ -15,8 +17,11 @@ services:
     image: caddy-docker-provider:dev
     depends_on:
       - caddy
+    healthcheck:
+      test: ["CMD-SHELL", "exit 0"]
+      #start_period: 30s
     environment:
-      CADDY_API_URL: http://localhost:2019/
+      #CADDY_API_URL: http://localhost:2019/
       LOG_LEVEL: DEBUG
     network_mode: service:caddy
     volumes:
@@ -30,6 +35,8 @@ services:
     deploy:
       replicas: 2
     labels:
-      caddy.http.enable: "true"
-      caddy.http.hosts: "example.com"
-      caddy.http.upstream.port: "8080"
+      caddy.enable: "true"
+      caddy.routes.busybox.hosts: example.com example.org
+      caddy.routes.busybox.upstream.port: "8080"
+      caddy.routes.busybox2.hosts: busybox.example.com
+      caddy.routes.busybox2.upstream.port: "8081"
