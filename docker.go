@@ -14,10 +14,11 @@ import (
 var (
 	LabelPrefix       = getenv("CADDY_LABEL_PREFIX", "caddy")
 	LabelServer       = fmt.Sprintf("%s.server", LabelPrefix)
-	LabelEnable       = fmt.Sprintf("%s.http.enable", LabelPrefix)
-	LabelHost         = fmt.Sprintf("%s.http.hosts", LabelPrefix)
-	LabelNetwork      = fmt.Sprintf("%s.http.network", LabelPrefix)
-	LabelUpstreamPort = fmt.Sprintf("%s.http.upstream.port", LabelPrefix)
+	LabelEnable       = fmt.Sprintf("%s.enable", LabelPrefix)
+	LabelNetwork      = fmt.Sprintf("%s.network", LabelPrefix)
+	LabelRoutes       = fmt.Sprintf("%s.routes", LabelPrefix)
+	LabelHost         = fmt.Sprintf("%s.routes.%s.hosts", LabelPrefix)
+	LabelUpstreamPort = fmt.Sprintf("%s.routes.%s.upstream.port", LabelPrefix)
 )
 
 var runningFilters = client.Filters{}.
@@ -39,8 +40,8 @@ type DockerClientImpl struct {
 type DockerClient interface {
 	ConnectToNetwork(ctx context.Context, networkId string) error
 	DisconnectFromNetwork(ctx context.Context, networkId string) error
-	GetContainerRoutes(ctx context.Context, containerId string) ([]RouteEntry, error)
-	GetUpstreamContainers(ctx context.Context) ([]RouteEntry, error)
+	GetContainerRoutes(ctx context.Context, containerId string) (map[string]RouteEntry, error)
+	GetRoutableContainers(ctx context.Context) ([]string, error)
 	Listen(ctx context.Context) (<-chan events.Message, <-chan error)
 }
 
@@ -154,7 +155,7 @@ func (docker *DockerClientImpl) DisconnectFromNetwork(ctx context.Context, netwo
 	return nil
 }
 
-func (docker *DockerClientImpl) GetContainerRoutes(ctx context.Context, containerID string) ([]RouteEntry, error) {
+func (docker *DockerClientImpl) GetContainerRoutes(ctx context.Context, containerID string) (map[string]RouteEntry, error) {
 	resp, err := docker.cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{Size: false})
 	if err != nil {
 		return nil, err
@@ -166,76 +167,100 @@ func (docker *DockerClientImpl) GetContainerRoutes(ctx context.Context, containe
 		return nil, fmt.Errorf("Container %s is not enabled %w", containerID, labels)
 	}
 
-	entry := RouteEntry{
-		ContainerID: resp.Container.ID,
-		Hosts:       strings.Split(labels[LabelHost], ","),
-		Network:     labels[LabelNetwork],
-		Port:        labels[LabelUpstreamPort],
-	}
-
-	if entry.Network == "" {
+	// Get the name of the network to use
+	networkName := labels[LabelNetwork]
+	if networkName == "" {
 		// Get the first network in the list
-		for name, network := range resp.Container.NetworkSettings.Networks {
-			entry.Network = name
-			entry.IP = network.IPAddress.String()
+		for name := range resp.Container.NetworkSettings.Networks {
+			networkName = name
 			break
 		}
 	}
 
-	// If the IP is still empty, try to get it from the specified network
-	if entry.IP == "" && entry.Network != "" {
-		network, exists := resp.Container.NetworkSettings.Networks[entry.Network]
-		if exists {
-			entry.IP = network.IPAddress.String()
+	// Get the IP on the target network
+	ip := containerID
+	network, exists := resp.Container.NetworkSettings.Networks[networkName]
+	if exists {
+		ip = network.IPAddress.String()
+	}
+
+	port := "80"
+	// Get the first exposed port
+	for p := range resp.Container.Config.ExposedPorts {
+		port = p.Port()
+		break
+	}
+
+	routes := make(map[string]RouteEntry)
+	for label, value := range labels {
+		suffix, exists := strings.CutPrefix(label, LabelRoutes+".")
+		if !exists {
+			continue
 		}
-	}
 
-	if entry.Port == "" {
-		// Get the first exposed port
-		for p := range resp.Container.Config.ExposedPorts {
-			entry.Port = p.Port()
-			break
+		parts := strings.Split(suffix, ".")
+		routeID := parts[0]
+
+		route, exists := routes[routeID]
+		if !exists {
+			route = RouteEntry{
+				RouteID:   routeID,
+				Upstreams: make(map[string]RouteUpstream),
+			}
 		}
+
+		upstream, exists := route.Upstreams[resp.Container.ID]
+		if !exists {
+			upstream = RouteUpstream{
+				ContainerID: resp.Container.ID,
+				Network:     networkName,
+				IP:          ip,
+				Port:        port,
+			}
+		}
+
+		// Apply the label value to the appropriate construct
+		subSection := parts[1]
+		switch subSection {
+		case "hosts":
+			route.Hosts = strings.Split(value, " ")
+		case "paths":
+			route.Paths = strings.Split(value, " ")
+		case "upstream":
+			upstream.Port = value
+		}
+
+		// Replace the values (as these are not references)
+		route.Upstreams[resp.Container.ID] = upstream
+		routes[routeID] = route
 	}
 
-	// Verify we have a valid route before returning
-	if len(entry.Hosts) == 0 || entry.Network == "" || entry.Port == "" {
-		return nil, fmt.Errorf("Container %s is missing required labels: host=%s, network=%s, port=%s", containerID, entry.Hosts, entry.Network, entry.Port)
-	}
-
-	return []RouteEntry{
-		entry,
-	}, nil
+	slog.Debug("Parsed container routes", slog.Any("routes", routes))
+	return routes, nil
 }
 
-func (docker *DockerClientImpl) GetUpstreamContainers(ctx context.Context) ([]RouteEntry, error) {
-	routes := []RouteEntry{}
+func (docker *DockerClientImpl) GetRoutableContainers(ctx context.Context) ([]string, error) {
+	var containerIDs []string
 	resp, err := docker.cli.ContainerList(ctx, client.ContainerListOptions{Filters: upstreamFilters})
 	if err != nil {
-		return routes, err
+		return containerIDs, err
 	}
 
 	if len(resp.Items) == 0 {
 		slog.Debug("No routes found on existing containers")
-		return routes, nil
+		return containerIDs, nil
 	}
 
 	for _, item := range resp.Items {
 		if !docker.isRoutableContainer(item.Labels) {
-			slog.Debug("Container is not routable, skipping", slog.String("containerId", item.ID))
+			slog.Debug("Container is not routable, skipping", slog.String("containerID", item.ID))
 			continue
 		}
 
-		cr, err := docker.GetContainerRoutes(ctx, item.ID)
-		if err != nil {
-			slog.Debug("Error while getting routes for container", slog.String("containerId", item.ID), slog.String("error", err.Error()))
-			continue
-		}
-
-		routes = append(routes, cr...)
+		containerIDs = append(containerIDs, item.ID)
 	}
 
-	return routes, nil
+	return containerIDs, nil
 }
 
 func (docker *DockerClientImpl) Listen(ctx context.Context) (<-chan events.Message, <-chan error) {

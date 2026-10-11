@@ -5,51 +5,83 @@ import (
 )
 
 type RouteEntry struct {
+	RouteID   string
+	Hosts     []string
+	Paths     []string
+	Upstreams map[string]RouteUpstream
+}
+
+type RouteUpstream struct {
 	ContainerID string
-	Hosts       []string
 	Network     string
-	Port        string
 	IP          string
+	Port        string
 }
 
 type AppStateImpl struct {
 	caddyContainerID string
 	caddyNetworkID   string
-	routes           []RouteEntry
+	routes           map[string]RouteEntry
 	mutex            *sync.Mutex
 }
 
 type AppState interface {
-	AddRoute(entry RouteEntry)
-	FindByContainer(containerId string) *RouteEntry
+	AddRoute(route RouteEntry)
+	Find(routeID string) (*RouteEntry, bool)
+	FindByContainer(containerID string) []RouteEntry
 	HasNetworkRoutes(network string) bool
-	RemoveRoute(entry RouteEntry)
+	RemoveRoute(routeID string)
 }
 
 func NewStateBag() AppState {
 	return &AppStateImpl{
-		routes: []RouteEntry{},
+		routes: make(map[string]RouteEntry),
 		mutex:  &sync.Mutex{},
 	}
 }
 
-func (state *AppStateImpl) AddRoute(entry RouteEntry) {
+func (route *RouteEntry) TryAddUpstream(upstream RouteUpstream) bool {
+	if route.Upstreams == nil {
+		route.Upstreams = make(map[string]RouteUpstream)
+	}
+
+	_, exists := route.Upstreams[upstream.ContainerID]
+	if exists {
+		return false
+	}
+
+	route.Upstreams[upstream.ContainerID] = upstream
+	return true
+}
+
+func (state *AppStateImpl) AddRoute(route RouteEntry) {
 	state.mutex.Lock()
-	state.routes = append(state.routes, entry)
+	state.routes[route.RouteID] = route
 	state.mutex.Unlock()
 }
 
-func (state *AppStateImpl) FindByContainer(containerID string) *RouteEntry {
+func (state *AppStateImpl) Find(routeID string) (*RouteEntry, bool) {
 	state.mutex.Lock()
 	defer state.mutex.Unlock()
 
-	for _, item := range state.routes {
-		if item.ContainerID == containerID {
-			return &item
+	route, exists := state.routes[routeID]
+	return &route, exists
+}
+
+func (state *AppStateImpl) FindByContainer(containerID string) []RouteEntry {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	routes := make([]RouteEntry, 0)
+	for _, route := range state.routes {
+		for _, upstream := range route.Upstreams {
+			if upstream.ContainerID == containerID {
+				routes = append(routes, route)
+			}
 		}
 	}
 
-	return nil
+	return routes
 }
 
 func (state *AppStateImpl) HasNetworkRoutes(networkID string) bool {
@@ -57,22 +89,18 @@ func (state *AppStateImpl) HasNetworkRoutes(networkID string) bool {
 	defer state.mutex.Unlock()
 
 	for _, item := range state.routes {
-		if item.Network == networkID {
-			return true
+		for _, upstream := range item.Upstreams {
+			if upstream.Network == networkID {
+				return true
+			}
 		}
 	}
 
 	return false
 }
 
-func (state *AppStateImpl) RemoveRoute(entry RouteEntry) {
+func (state *AppStateImpl) RemoveRoute(routeID string) {
 	state.mutex.Lock()
-
-	for i, item := range state.routes {
-		if item.ContainerID == entry.ContainerID {
-			state.routes = append(state.routes[:i], state.routes[i+1:]...)
-		}
-	}
-
+	delete(state.routes, routeID)
 	state.mutex.Unlock()
 }
