@@ -1,9 +1,0 @@
-{
-    debug
-    local_certs
-}
-
-* {
-    root * /usr/share/caddy
-    file_server
-}

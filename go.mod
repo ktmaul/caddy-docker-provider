@@ -1,4 +1,4 @@
-module github.com/ktmaul/caddy-network-connector
+module github.com/ktmaul/caddy-docker-provider
 
 go 1.25.8
 

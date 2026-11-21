@@ -6,16 +6,18 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/moby/moby/api/types/events"
 )
 
-type CaddyManager struct {
+type CaddyProvider struct {
 	caddy  CaddyClient
 	docker DockerClient
-	state  StateBag
+	mutex  *sync.Mutex
+	state  AppState
 }
 
 func getenv(k, d string) string {
@@ -26,68 +28,132 @@ func getenv(k, d string) string {
 	return v
 }
 
-func (manager *CaddyManager) handleContainerStart(ctx context.Context, containerId string) error {
-	routes, err := manager.docker.GetContainerRoutes(ctx, containerId)
+func (app *CaddyProvider) handleContainerStart(ctx context.Context, containerID string) {
+	app.mutex.Lock()
+	defer app.mutex.Unlock()
+
+	routes, err := app.docker.GetContainerRoutes(ctx, containerID)
 	if err != nil {
-		return err
+		slog.Error(err.Error())
+		return
 	}
 
-	for _, entry := range routes {
-		err = manager.caddy.CreateRoute(ctx, entry)
-		if err != nil {
-			return err
+	for _, pending := range routes {
+		route, exists := app.state.Find(pending.RouteID)
+
+		// If the route doesn't exist, create it and add it to the state
+		if !exists {
+			app.caddy.CreateRoute(ctx, pending)
+			app.state.AddRoute(pending)
+			slog.Info("Added route", slog.String("routeID", pending.RouteID), slog.Any("hosts", pending.Hosts), slog.Any("upstreams", pending.Upstreams))
+			continue
 		}
 
-		err = manager.docker.ConnectToNetwork(ctx, entry.Network)
-		if err != nil {
-			return err
-		}
+		// Otherwise, add any new upstreams to the existing route and connect to the network
+		for _, upstream := range pending.Upstreams {
+			if !route.TryAddUpstream(upstream) {
+				continue
+			}
 
-		manager.state.AddRoute(entry)
+			err = app.caddy.CreateUpstream(ctx, route.RouteID, upstream)
+			if err != nil {
+				slog.Error(err.Error())
+				continue
+			}
+
+			err = app.docker.ConnectToNetwork(ctx, upstream.Network)
+			if err != nil {
+				slog.Error(err.Error())
+				continue
+			}
+
+			slog.Info("Added upstream",
+				slog.String("routeID", route.RouteID),
+				slog.String("containerID", upstream.ContainerID),
+				slog.String("network", upstream.Network),
+				slog.String("ip", upstream.IP),
+				slog.String("port", upstream.Port))
+		}
 	}
-
-	return nil
 }
 
-func (manager *CaddyManager) handleContainerStop(ctx context.Context, containerId string) error {
-	route := manager.state.FindByContainer(containerId)
-	if route == nil {
-		return nil // Do nothing (this often happens with destroy events)
+func (app *CaddyProvider) handleContainerStop(ctx context.Context, containerID string) {
+	app.mutex.Lock()
+	defer app.mutex.Unlock()
+
+	routes := app.state.FindByContainer(containerID)
+	if len(routes) == 0 {
+		return // Do nothing (this often happens with destroy events)
 	}
 
-	manager.state.RemoveRoute(*route)
+	var networks []string
+	for _, route := range routes {
+		// Remove the upstreams for this container
+		for upstreamID, upstream := range route.Upstreams {
+			if upstream.ContainerID != containerID {
+				continue
+			}
 
-	err := manager.caddy.RemoveRoute(ctx, *route)
-	if err != nil {
-		return err
-	}
+			err := app.caddy.RemoveUpstream(ctx, route.RouteID, upstreamID)
+			if err != nil {
+				slog.Error(err.Error())
+				continue
+			}
 
-	if manager.state.HasNetworkRoutes(route.Network) {
-		err = manager.docker.DisconnectFromNetwork(ctx, route.Network)
-		if err != nil {
-			return err
+			networks = append(networks, upstream.Network)
+			delete(route.Upstreams, upstreamID)
+			slog.Info("Removed upstream", slog.String("routeID", route.RouteID), slog.String("containerID", upstream.ContainerID))
+		}
+
+		// If there are no more upstreams for this route, remove the route from caddy and the state
+		if len(route.Upstreams) == 0 {
+			err := app.caddy.RemoveRoute(ctx, route.RouteID)
+			if err != nil {
+				slog.Error(err.Error())
+			}
+
+			app.state.RemoveRoute(route.RouteID)
+			slog.Info("Removed route", slog.String("routeID", route.RouteID))
 		}
 	}
 
-	return nil
+	for _, network := range networks {
+		if !app.state.HasNetworkRoutes(network) {
+			err := app.docker.DisconnectFromNetwork(ctx, network)
+			if err != nil {
+				slog.Error(err.Error())
+			}
+		}
+	}
 }
 
-func (manager *CaddyManager) handleEvent(ctx context.Context, ev events.Message) {
+func (app *CaddyProvider) handleEvent(ctx context.Context, ev events.Message) {
 	id := ev.Actor.ID
 	action := ev.Action
 	slog.Debug("Docker event received", slog.String("actor", id), "action", action)
 
 	switch action {
 	case "start":
-		if err := manager.handleContainerStart(ctx, id); err != nil {
-			slog.Error(err.Error())
-		}
+		app.handleContainerStart(ctx, id)
 	case "die", "destroy":
-		if err := manager.handleContainerStop(ctx, id); err != nil {
-			slog.Error(err.Error())
-		}
+		app.handleContainerStop(ctx, id)
 	default:
 		// ignore
+	}
+}
+
+func (app *CaddyProvider) pollContainers(ctx context.Context) {
+	slog.Info("Checking running containers...")
+	containerIDs, err := app.docker.GetRoutableContainers(ctx)
+	if err != nil {
+		slog.Error("Failed to get routable containers", slog.String("error", err.Error()))
+	}
+
+	// Add any new routes to caddy and connect to networks
+	if len(containerIDs) > 0 {
+		for _, containerID := range containerIDs {
+			app.handleContainerStart(ctx, containerID)
+		}
 	}
 }
 
@@ -111,7 +177,8 @@ func main() {
 	}()
 
 	// Initialize our application state
-	app := CaddyManager{
+	app := CaddyProvider{
+		mutex: &sync.Mutex{},
 		state: NewStateBag(),
 	}
 
@@ -136,30 +203,17 @@ func main() {
 			app.docker = docker
 		}
 
-		slog.Info("Getting upstream containers...")
-		routes, err := app.docker.GetUpstreamContainers(ctx)
-		if err != nil {
-			slog.Error("Failed to get upstream containers", slog.String("error", err.Error()))
-		}
-
-		// Add any new routes to caddy and connect to networks
-		if len(routes) > 0 {
-			for _, route := range routes {
-				err = app.caddy.CreateRoute(ctx, route)
-				if err != nil {
-					slog.Error("Failed to create route in caddy", slog.String("error", err.Error()))
-					break
-				}
-
-				err = app.docker.ConnectToNetwork(ctx, route.Network)
-				if err != nil {
-					slog.Error("Failed to connect to network", slog.String("error", err.Error()))
-					break
-				}
-
-				app.state.AddRoute(route)
+		if app.caddy == nil || app.docker == nil {
+			select {
+			case <-time.After(duration):
+				slog.Debug("Attempting to reconnect after timeout", slog.String("duration", duration.String()))
+				continue
+			case <-ctx.Done():
+				return
 			}
 		}
+
+		go app.pollContainers(ctx)
 
 	ListenEvents:
 		for {
@@ -173,6 +227,8 @@ func main() {
 					slog.Error("Error listening to events", slog.String("error", err.Error()))
 				}
 				break ListenEvents
+			case <-ctx.Done():
+				return
 			}
 		}
 
