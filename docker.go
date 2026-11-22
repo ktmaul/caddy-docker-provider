@@ -208,7 +208,7 @@ func (docker *DockerClientImpl) GetContainerRoutes(ctx context.Context, containe
 		if !exists {
 			upstream = RouteUpstream{
 				ContainerID: resp.Container.ID,
-				Network:     networkName,
+				Network:     networkId,
 				IP:          ip,
 				Port:        port,
 			}
