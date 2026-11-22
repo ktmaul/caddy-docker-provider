@@ -167,21 +167,16 @@ func (docker *DockerClientImpl) GetContainerRoutes(ctx context.Context, containe
 		return nil, fmt.Errorf("Container %s is not enabled %w", containerID, labels)
 	}
 
-	// Get the name of the network to use
-	networkName := labels[LabelNetwork]
-	if networkName == "" {
+	// Get the network and IP of the network to use
+	ip := containerID
+	networkId := labels[LabelNetwork]
+	if networkId == "" {
 		// Get the first network in the list
-		for name := range resp.Container.NetworkSettings.Networks {
-			networkName = name
+		for _, network := range resp.Container.NetworkSettings.Networks {
+			networkId = network.NetworkID
+			ip = network.IPAddress.String()
 			break
 		}
-	}
-
-	// Get the IP on the target network
-	ip := containerID
-	network, exists := resp.Container.NetworkSettings.Networks[networkName]
-	if exists {
-		ip = network.IPAddress.String()
 	}
 
 	port := "80"
@@ -213,7 +208,7 @@ func (docker *DockerClientImpl) GetContainerRoutes(ctx context.Context, containe
 		if !exists {
 			upstream = RouteUpstream{
 				ContainerID: resp.Container.ID,
-				Network:     networkName,
+				Network:     networkId,
 				IP:          ip,
 				Port:        port,
 			}
